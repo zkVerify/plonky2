@@ -801,6 +801,8 @@ pub trait Read {
 
         common_data.gates = gates;
 
+        common_data.validate().map_err(|_| IoError)?;
+
         Ok(common_data)
     }
 

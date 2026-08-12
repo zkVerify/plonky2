@@ -18,7 +18,7 @@ use core::ops::{Range, RangeFrom};
 #[cfg(feature = "std")]
 use std::collections::BTreeMap;
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use serde::Serialize;
 
 use super::circuit_builder::LookupWire;
@@ -468,6 +468,106 @@ impl<F: RichField + Extendable<D>, const D: usize> CommonCircuitData<F, D> {
         buffer.read_common_circuit_data(gate_serializer)
     }
 
+    /// Checks that this data could have been produced by [`CircuitBuilder::build`].
+    ///
+    /// The verifier uses these fields as indices and loop bounds before looking at any proof data.
+    pub fn validate(&self) -> Result<()> {
+        let num_gates = self.gates.len();
+        let SelectorsInfo {
+            selector_indices,
+            groups,
+        } = &self.selectors_info;
+
+        // The builder dedups gate types by `id()` and sorts them by `(degree, id)`. Requiring the
+        // same here also rules out repeated gate types, which multiply the verifier's work.
+        for pair in self.gates.windows(2) {
+            ensure!(
+                (pair[0].0.degree(), pair[0].0.id()) < (pair[1].0.degree(), pair[1].0.id()),
+                "Gate types must be sorted by (degree, id), without duplicates."
+            );
+        }
+
+        ensure!(
+            selector_indices.len() == num_gates,
+            "There must be exactly one selector index per gate type."
+        );
+        // The groups partition `0..num_gates` into contiguous, non-empty ranges.
+        let mut expected_start = 0;
+        for group in groups {
+            // Checked before the slicing below, which would otherwise panic.
+            ensure!(
+                group.start == expected_start && group.end <= num_gates,
+                "Selector groups must be contiguous and index into the gate list."
+            );
+            ensure!(
+                group.start < group.end,
+                "Selector groups must be non-empty."
+            );
+
+            // `selector_polynomials` keeps a group of size `s` whose largest gate has degree `d`
+            // within the quotient's degree budget, i.e. `s + d <= quotient_degree_factor + 2`.
+            let max_degree_in_group = self.gates[group.clone()]
+                .iter()
+                .map(|g| g.0.degree())
+                .max()
+                .expect("Group was checked to be non-empty");
+            ensure!(
+                group.end - group.start + max_degree_in_group <= self.quotient_degree_factor + 2,
+                "Selector group is too large for the quotient degree budget."
+            );
+
+            expected_start = group.end;
+        }
+        ensure!(
+            expected_start == num_gates,
+            "Selector groups must cover every gate type."
+        );
+
+        for (i, &selector_index) in selector_indices.iter().enumerate() {
+            ensure!(
+                selector_index < groups.len() && groups[selector_index].contains(&i),
+                "A gate's selector index does not point to the group containing that gate."
+            );
+        }
+
+        // The selector polynomials are the first constant polynomials, and the verifier indexes
+        // `local_constants` with a selector index.
+        ensure!(
+            groups.len() + self.num_lookup_selectors <= self.num_constants,
+            "There are more selector polynomials than constant polynomials."
+        );
+
+        // `evaluate_gate_constraints` indexes a buffer of this length without a bounds check.
+        for gate in &self.gates {
+            ensure!(
+                gate.0.num_constraints() <= self.num_gate_constraints,
+                "A gate imposes more constraints than num_gate_constraints."
+            );
+        }
+
+        ensure!(
+            self.quotient_degree_factor == self.config.max_quotient_degree_factor,
+            "quotient_degree_factor does not match the configured maximum."
+        );
+
+        // `primitive_root_of_unity` asserts this, and the verifier raises `zeta` to the power
+        // `2^degree_bits` one squaring at a time.
+        ensure!(
+            self.degree_bits() + self.config.fri_config.rate_bits <= F::TWO_ADICITY,
+            "The LDE domain does not exist in this field."
+        );
+
+        // `FriConfig::fri_params` clones these out of the circuit config. The challenger and the
+        // FRI verifier read different copies, so they have to agree.
+        ensure!(
+            self.fri_params.config == self.config.fri_config
+                && self.fri_params.hiding == self.config.zero_knowledge,
+            "The FRI parameters do not match the circuit config."
+        );
+
+        Ok(())
+    }
+
     pub const fn degree_bits(&self) -> usize {
         self.fri_params.degree_bits
     }
@@ -675,4 +775,111 @@ pub struct VerifierCircuitTarget {
     /// A digest of the "circuit" (i.e. the instance, minus public inputs), which can be used to
     /// seed Fiat-Shamir.
     pub circuit_digest: HashOutTarget,
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+
+    use super::*;
+    use crate::gates::noop::NoopGate;
+    use crate::hash::poseidon::PoseidonHash;
+    use crate::iop::witness::PartialWitness;
+    use crate::plonk::config::PoseidonGoldilocksConfig;
+    use crate::util::serialization::DefaultGateSerializer;
+
+    const D: usize = 2;
+    type C = PoseidonGoldilocksConfig;
+    type F = <C as GenericConfig<D>>::F;
+
+    /// A circuit using enough gate types to be split into several selector groups.
+    fn test_circuit() -> Result<CircuitData<F, C, D>> {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let x = builder.constant(F::from_canonical_u64(7));
+        let y = builder.mul(x, x);
+        let z = builder.add(y, x);
+        let h = builder.hash_n_to_hash_no_pad::<PoseidonHash>(vec![x, y, z]);
+        builder.register_public_inputs(&h.elements);
+        builder.add_gate(NoopGate, vec![]);
+        Ok(builder.build::<C>())
+    }
+
+    #[test]
+    fn validates_circuit_built_by_the_builder() -> Result<()> {
+        let common = test_circuit()?.common;
+        assert!(common.selectors_info.groups.len() > 1);
+        common.validate()
+    }
+
+    #[test]
+    fn rejects_oversized_selector_group() -> Result<()> {
+        let mut common = test_circuit()?.common;
+        common.selectors_info.groups[0].end = 1 << 32;
+        assert!(common.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_duplicated_gate_types() -> Result<()> {
+        let mut common = test_circuit()?.common;
+        common.gates.push(common.gates[0].clone());
+        assert!(common.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_selector_index_outside_its_group() -> Result<()> {
+        let mut common = test_circuit()?.common;
+        let last = common.selectors_info.selector_indices.len() - 1;
+        common.selectors_info.selector_indices[last] = 0;
+        assert!(common.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn deserialization_rejects_oversized_selector_group() -> Result<()> {
+        let mut common = test_circuit()?.common;
+        common.selectors_info.groups[0].end = 1 << 32;
+
+        let gate_serializer = DefaultGateSerializer;
+        let bytes = common.to_bytes(&gate_serializer).unwrap();
+        assert!(CommonCircuitData::<F, D>::from_bytes(bytes, &gate_serializer).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_degree_bits_outside_the_field() -> Result<()> {
+        let mut common = test_circuit()?.common;
+        common.fri_params.degree_bits = 1 << 50;
+        assert!(common.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_fri_params_disagreeing_with_the_config() -> Result<()> {
+        let mut common = test_circuit()?.common;
+        common.fri_params.config.num_query_rounds += 1;
+        assert!(common.validate().is_err());
+        Ok(())
+    }
+
+    /// The verifier must reject a tampered verification key rather than iterate over a count taken
+    /// from it. Both counts here are attacker-controlled when the key is.
+    #[test]
+    fn verifier_rejects_tampered_verification_key() -> Result<()> {
+        let data = test_circuit()?;
+        let proof = data.prove(PartialWitness::new())?;
+        data.verify(proof.clone())?;
+
+        let mut verifier_data = data.verifier_data();
+        verifier_data.common.selectors_info.groups[0].end = 1 << 32;
+        assert!(verifier_data.verify(proof.clone()).is_err());
+
+        // Drives the challenger's query-index loop, before the FRI verifier's own check.
+        let mut verifier_data = data.verifier_data();
+        verifier_data.common.config.fri_config.num_query_rounds = 1 << 50;
+        verifier_data.common.fri_params.config.num_query_rounds = 1 << 50;
+        assert!(verifier_data.verify(proof).is_err());
+        Ok(())
+    }
 }

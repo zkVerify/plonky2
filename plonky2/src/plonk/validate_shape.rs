@@ -40,9 +40,9 @@ where
         plonk_zs_partial_products_cap,
         quotient_polys_cap,
         openings,
-        // The shape of the opening proof will be checked in the FRI verifier (see
-        // validate_fri_proof_shape), so we ignore it here.
-        opening_proof: _,
+        // The rest of the opening proof's shape is checked in the FRI verifier (see
+        // validate_fri_proof_shape).
+        opening_proof,
     } = proof;
     let OpeningSet {
         constants,
@@ -68,5 +68,8 @@ where
     ensure!(quotient_polys.len() == common_data.num_quotient_polys());
     ensure!(lookup_zs.len() == common_data.num_all_lookup_polys());
     ensure!(lookup_zs_next.len() == common_data.num_all_lookup_polys());
+    ensure!(
+        opening_proof.query_round_proofs.len() == common_data.fri_params.config.num_query_rounds
+    );
     Ok(())
 }
