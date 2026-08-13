@@ -675,7 +675,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CommonCircuitData<F, D> {
         }
     }
 
-    fn fri_oracles(&self) -> Vec<FriOracleInfo> {
+    pub(crate) fn fri_oracles(&self) -> Vec<FriOracleInfo> {
         vec![
             FriOracleInfo {
                 num_polys: self.num_preprocessed_polys(),
@@ -732,7 +732,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CommonCircuitData<F, D> {
     }
 
     /// Returns polynomials that require evaluation at `zeta` and `g * zeta`.
-    fn fri_next_batch_polys(&self) -> Vec<FriPolynomialInfo> {
+    pub(crate) fn fri_next_batch_polys(&self) -> Vec<FriPolynomialInfo> {
         [self.fri_zs_polys(), self.fri_lookup_polys()].concat()
     }
 
@@ -752,7 +752,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CommonCircuitData<F, D> {
         self.config.num_challenges * self.quotient_degree_factor
     }
 
-    fn fri_all_polys(&self) -> Vec<FriPolynomialInfo> {
+    pub(crate) fn fri_all_polys(&self) -> Vec<FriPolynomialInfo> {
         [
             self.fri_preprocessed_polys(),
             self.fri_wire_polys(),

@@ -991,6 +991,57 @@ pub trait Read {
         })
     }
 
+    /// Returns the exact size in bytes of a serialized [`Proof`] with the given `common` data.
+    #[inline]
+    fn proof_size<F, C, const D: usize>(common: &CommonCircuitData<F, D>) -> usize
+    where
+        F: RichField + Extendable<D>,
+        C: GenericConfig<D, F = F>,
+    {
+        let fri_config = &common.config.fri_config;
+        let fri_params = &common.fri_params;
+        let cap_height = fri_config.cap_height;
+        let field_size = size_of::<u64>();
+        let ext_size = D * field_size;
+        let hash_size = <C::Hasher as Hasher<F>>::HASH_SIZE;
+        let cap_size = (1 << cap_height) * hash_size;
+        // A Merkle proof is a `u8` length prefix followed by the siblings.
+        let merkle_proof_size = |tree_height: usize| 1 + (tree_height - cap_height) * hash_size;
+
+        // wires_cap, plonk_zs_partial_products_cap, quotient_polys_cap
+        // and the FRI commit phase caps.
+        let num_caps = 3 + fri_params.reduction_arity_bits.len();
+        let mut size = num_caps * cap_size;
+
+        // Opening set: all polynomials at `zeta`, plus Zs and lookups at `g * zeta`.
+        let num_openings = common.fri_all_polys().len() + common.fri_next_batch_polys().len();
+        size += num_openings * ext_size;
+
+        // One FRI query round: evals and Merkle proof per initial tree...
+        let lde_bits = fri_params.lde_bits();
+        let mut round_size = common
+            .fri_oracles()
+            .iter()
+            .map(|oracle| {
+                salt_size(oracle.blinding && fri_params.hiding) * field_size
+                    + oracle.num_polys * field_size
+                    + merkle_proof_size(lde_bits)
+            })
+            .sum::<usize>();
+        // ...then evals and a shrinking Merkle proof per reduction step.
+        let mut layer_bits = lde_bits;
+        for &arity_bits in &fri_params.reduction_arity_bits {
+            layer_bits -= arity_bits;
+            round_size += (1 << arity_bits) * ext_size + merkle_proof_size(layer_bits);
+        }
+        size += fri_config.num_query_rounds * round_size;
+
+        // final_poly, pow_witness
+        size += fri_params.final_poly_len() * ext_size + field_size;
+
+        size
+    }
+
     /// Reads a value of type [`ProofTarget`] from `self`.
     #[inline]
     fn read_target_proof<const D: usize>(&mut self) -> IoResult<ProofTarget<D>> {
@@ -2231,5 +2282,61 @@ impl Read for Buffer<'_> {
         common_data: &CommonCircuitData<F, D>,
     ) -> IoResult<WitnessGeneratorRef<F, D>> {
         generator_serializer.read_generator(self, common_data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+
+    use super::*;
+    use crate::field::types::Field;
+    use crate::gates::lookup_table::LookupTable;
+    use crate::gates::noop::NoopGate;
+    use crate::iop::witness::PartialWitness;
+    use crate::plonk::circuit_builder::CircuitBuilder;
+    use crate::plonk::config::{KeccakGoldilocksConfig, PoseidonGoldilocksConfig};
+
+    fn check_proof_size<C: GenericConfig<D>, const D: usize>(
+        config: CircuitConfig,
+        with_lookup: bool,
+    ) -> Result<()> {
+        let mut builder = CircuitBuilder::<C::F, D>::new(config);
+        let xt = builder.constant(C::F::TWO);
+        let yt = builder.constant(C::F::TWO);
+        let zt = builder.constant(C::F::from_canonical_u64(4));
+        let comp_zt = builder.mul(xt, yt);
+        builder.connect(zt, comp_zt);
+        if with_lookup {
+            let table: LookupTable = Arc::new((0..16).map(|i| (i, i + 1)).collect());
+            let lut_index = builder.add_lookup_table_from_pairs(table);
+            let out = builder.constant(C::F::from_canonical_u64(3));
+            let look_out = builder.add_lookup_from_index(xt, lut_index);
+            builder.connect(look_out, out);
+        }
+        for _ in 0..100 {
+            builder.add_gate(NoopGate, vec![]);
+        }
+        let data = builder.build::<C>();
+        let proof = data.prove(PartialWitness::new())?;
+
+        let mut bytes = Vec::new();
+        bytes.write_proof(&proof.proof).unwrap();
+        assert_eq!(bytes.len(), Buffer::proof_size::<C::F, C, D>(&data.common));
+        Ok(())
+    }
+
+    #[test]
+    fn test_proof_size() -> Result<()> {
+        const D: usize = 2;
+        for (config, with_lookup) in [
+            (CircuitConfig::standard_recursion_config(), false),
+            (CircuitConfig::standard_recursion_config(), true),
+            (CircuitConfig::standard_recursion_zk_config(), false),
+        ] {
+            check_proof_size::<PoseidonGoldilocksConfig, D>(config.clone(), with_lookup)?;
+            check_proof_size::<KeccakGoldilocksConfig, D>(config, with_lookup)?;
+        }
+        Ok(())
     }
 }
