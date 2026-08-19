@@ -14,6 +14,7 @@
 
 #[cfg(not(feature = "std"))]
 use alloc::{collections::BTreeMap, vec, vec::Vec};
+use core::mem::size_of;
 use core::ops::{Range, RangeFrom};
 #[cfg(feature = "std")]
 use std::collections::BTreeMap;
@@ -44,7 +45,7 @@ use crate::iop::target::Target;
 use crate::iop::witness::{PartialWitness, PartitionWitness};
 use crate::plonk::circuit_builder::CircuitBuilder;
 use crate::plonk::config::{GenericConfig, Hasher};
-use crate::plonk::plonk_common::PlonkOracle;
+use crate::plonk::plonk_common::{salt_size, PlonkOracle};
 use crate::plonk::proof::{CompressedProofWithPublicInputs, ProofWithPublicInputs};
 use crate::plonk::prover::prove;
 use crate::plonk::verifier::verify;
@@ -151,7 +152,7 @@ pub struct MockCircuitData<F: RichField + Extendable<D>, C: GenericConfig<D, F =
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     MockCircuitData<F, C, D>
 {
-    pub fn generate_witness(&self, inputs: PartialWitness<F>) -> PartitionWitness<F> {
+    pub fn generate_witness(&self, inputs: PartialWitness<F>) -> PartitionWitness<'_, F> {
         generate_partial_witness::<F, C, D>(inputs, &self.prover_only, &self.common).unwrap()
     }
 }
@@ -537,13 +538,19 @@ impl<F: RichField + Extendable<D>, const D: usize> CommonCircuitData<F, D> {
             "There are more selector polynomials than constant polynomials."
         );
 
-        // `evaluate_gate_constraints` indexes a buffer of this length without a bounds check.
-        for gate in &self.gates {
-            ensure!(
-                gate.0.num_constraints() <= self.num_gate_constraints,
-                "A gate imposes more constraints than num_gate_constraints."
-            );
-        }
+        // `evaluate_gate_constraints` allocates a buffer of this length and the verifier then
+        // reduces every element of it, so an inflated value is unbounded verifier work that no
+        // proof length pays for. The builder takes the maximum, so require exactly that.
+        ensure!(
+            self.num_gate_constraints
+                == self
+                    .gates
+                    .iter()
+                    .map(|g| g.0.num_constraints())
+                    .max()
+                    .unwrap_or(0),
+            "num_gate_constraints does not match the gate list."
+        );
 
         ensure!(
             self.quotient_degree_factor == self.config.max_quotient_degree_factor,
@@ -566,6 +573,65 @@ impl<F: RichField + Extendable<D>, const D: usize> CommonCircuitData<F, D> {
         );
 
         Ok(())
+    }
+
+    /// Returns the exact size in bytes of a serialized [`Proof`] for this circuit, as written by
+    /// [`Write::write_proof`](crate::util::serialization::Write::write_proof).
+    ///
+    /// Returns `None` if the parameters are inconsistent, e.g. a cap taller than the tree it caps
+    /// or reduction arities exceeding the degree. This cannot happen for data that has passed
+    /// [`CommonCircuitData::validate`], so a caller sizing an untrusted proof can treat `None` as
+    /// a rejection rather than a panic.
+    pub fn proof_size<C: GenericConfig<D, F = F>>(&self) -> Option<usize> {
+        let fri_config = &self.config.fri_config;
+        let cap_height = fri_config.cap_height;
+        let field_size = size_of::<u64>();
+        let ext_size = D * field_size;
+        let hash_size = <C::Hasher as Hasher<F>>::HASH_SIZE;
+        let pow2 = |bits: usize| 1usize.checked_shl(u32::try_from(bits).ok()?);
+        let cap_size = pow2(cap_height)?.checked_mul(hash_size)?;
+        // A Merkle proof is a `u8` length prefix followed by the siblings.
+        let merkle_proof_size = |tree_height: usize| {
+            tree_height
+                .checked_sub(cap_height)?
+                .checked_mul(hash_size)?
+                .checked_add(1)
+        };
+
+        // wires_cap, plonk_zs_partial_products_cap, quotient_polys_cap
+        // and the FRI commit phase caps.
+        let num_caps = 3 + self.fri_params.reduction_arity_bits.len();
+        let mut size = num_caps.checked_mul(cap_size)?;
+
+        // Opening set: all polynomials at `zeta`, plus Zs and lookups at `g * zeta`.
+        let num_openings = self.fri_all_polys().len() + self.fri_next_batch_polys().len();
+        size = size.checked_add(num_openings.checked_mul(ext_size)?)?;
+
+        // One FRI query round: evals and Merkle proof per initial tree...
+        let lde_bits = self.degree_bits().checked_add(fri_config.rate_bits)?;
+        let mut round_size = 0usize;
+        for oracle in self.fri_oracles() {
+            let leaf_len = oracle
+                .num_polys
+                .checked_add(salt_size(oracle.blinding && self.fri_params.hiding))?;
+            round_size = round_size
+                .checked_add(leaf_len.checked_mul(field_size)?)?
+                .checked_add(merkle_proof_size(lde_bits)?)?;
+        }
+        // ...then evals and a shrinking Merkle proof per reduction step.
+        let mut layer_bits = lde_bits;
+        for &arity_bits in &self.fri_params.reduction_arity_bits {
+            layer_bits = layer_bits.checked_sub(arity_bits)?;
+            round_size = round_size
+                .checked_add(pow2(arity_bits)?.checked_mul(ext_size)?)?
+                .checked_add(merkle_proof_size(layer_bits)?)?;
+        }
+        size = size.checked_add(fri_config.num_query_rounds.checked_mul(round_size)?)?;
+
+        // final_poly, pow_witness. `layer_bits` is now `final_poly_bits + rate_bits`.
+        let final_poly_len = pow2(layer_bits.checked_sub(fri_config.rate_bits)?)?;
+        size.checked_add(final_poly_len.checked_mul(ext_size)?)?
+            .checked_add(field_size)
     }
 
     pub const fn degree_bits(&self) -> usize {
@@ -675,7 +741,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CommonCircuitData<F, D> {
         }
     }
 
-    pub(crate) fn fri_oracles(&self) -> Vec<FriOracleInfo> {
+    fn fri_oracles(&self) -> Vec<FriOracleInfo> {
         vec![
             FriOracleInfo {
                 num_polys: self.num_preprocessed_polys(),
@@ -732,7 +798,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CommonCircuitData<F, D> {
     }
 
     /// Returns polynomials that require evaluation at `zeta` and `g * zeta`.
-    pub(crate) fn fri_next_batch_polys(&self) -> Vec<FriPolynomialInfo> {
+    fn fri_next_batch_polys(&self) -> Vec<FriPolynomialInfo> {
         [self.fri_zs_polys(), self.fri_lookup_polys()].concat()
     }
 
@@ -752,7 +818,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CommonCircuitData<F, D> {
         self.config.num_challenges * self.quotient_degree_factor
     }
 
-    pub(crate) fn fri_all_polys(&self) -> Vec<FriPolynomialInfo> {
+    fn fri_all_polys(&self) -> Vec<FriPolynomialInfo> {
         [
             self.fri_preprocessed_polys(),
             self.fri_wire_polys(),
@@ -836,6 +902,16 @@ mod tests {
         Ok(())
     }
 
+    /// No proof length pays for this count, so it must be pinned exactly rather than bounded
+    /// from below by the gates' own constraint counts.
+    #[test]
+    fn rejects_inflated_num_gate_constraints() -> Result<()> {
+        let mut common = test_circuit()?.common;
+        common.num_gate_constraints += 1;
+        assert!(common.validate().is_err());
+        Ok(())
+    }
+
     #[test]
     fn deserialization_rejects_oversized_selector_group() -> Result<()> {
         let mut common = test_circuit()?.common;
@@ -863,6 +939,29 @@ mod tests {
         Ok(())
     }
 
+    /// Sizing an untrusted proof must not depend on the parameters being consistent.
+    #[test]
+    fn proof_size_rejects_inconsistent_parameters() -> Result<()> {
+        let common = test_circuit()?.common;
+        assert!(common.proof_size::<C>().is_some());
+
+        // A cap taller than the trees it caps.
+        let mut cap_too_tall = common.clone();
+        cap_too_tall.config.fri_config.cap_height = 40;
+        assert_eq!(cap_too_tall.proof_size::<C>(), None);
+
+        // A query count whose round size overflows.
+        let mut too_many_rounds = common.clone();
+        too_many_rounds.config.fri_config.num_query_rounds = 1 << 60;
+        assert_eq!(too_many_rounds.proof_size::<C>(), None);
+
+        // Reductions that overshoot the degree.
+        let mut arity_too_large = common;
+        arity_too_large.fri_params.reduction_arity_bits = vec![usize::MAX];
+        assert_eq!(arity_too_large.proof_size::<C>(), None);
+        Ok(())
+    }
+
     /// The verifier must reject a tampered verification key rather than iterate over a count taken
     /// from it. Both counts here are attacker-controlled when the key is.
     #[test]
@@ -879,6 +978,12 @@ mod tests {
         let mut verifier_data = data.verifier_data();
         verifier_data.common.config.fri_config.num_query_rounds = 1 << 50;
         verifier_data.common.fri_params.config.num_query_rounds = 1 << 50;
+        assert!(verifier_data.verify(proof.clone()).is_err());
+
+        // Sizes the buffer that `eval_vanishing_poly` reduces over. No proof length constrains
+        // it, so without this check the proof still verifies, just proportionally slower.
+        let mut verifier_data = data.verifier_data();
+        verifier_data.common.num_gate_constraints += 1;
         assert!(verifier_data.verify(proof).is_err());
         Ok(())
     }

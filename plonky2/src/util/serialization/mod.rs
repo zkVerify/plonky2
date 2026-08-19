@@ -991,57 +991,6 @@ pub trait Read {
         })
     }
 
-    /// Returns the exact size in bytes of a serialized [`Proof`] with the given `common` data.
-    #[inline]
-    fn proof_size<F, C, const D: usize>(common: &CommonCircuitData<F, D>) -> usize
-    where
-        F: RichField + Extendable<D>,
-        C: GenericConfig<D, F = F>,
-    {
-        let fri_config = &common.config.fri_config;
-        let fri_params = &common.fri_params;
-        let cap_height = fri_config.cap_height;
-        let field_size = size_of::<u64>();
-        let ext_size = D * field_size;
-        let hash_size = <C::Hasher as Hasher<F>>::HASH_SIZE;
-        let cap_size = (1 << cap_height) * hash_size;
-        // A Merkle proof is a `u8` length prefix followed by the siblings.
-        let merkle_proof_size = |tree_height: usize| 1 + (tree_height - cap_height) * hash_size;
-
-        // wires_cap, plonk_zs_partial_products_cap, quotient_polys_cap
-        // and the FRI commit phase caps.
-        let num_caps = 3 + fri_params.reduction_arity_bits.len();
-        let mut size = num_caps * cap_size;
-
-        // Opening set: all polynomials at `zeta`, plus Zs and lookups at `g * zeta`.
-        let num_openings = common.fri_all_polys().len() + common.fri_next_batch_polys().len();
-        size += num_openings * ext_size;
-
-        // One FRI query round: evals and Merkle proof per initial tree...
-        let lde_bits = fri_params.lde_bits();
-        let mut round_size = common
-            .fri_oracles()
-            .iter()
-            .map(|oracle| {
-                salt_size(oracle.blinding && fri_params.hiding) * field_size
-                    + oracle.num_polys * field_size
-                    + merkle_proof_size(lde_bits)
-            })
-            .sum::<usize>();
-        // ...then evals and a shrinking Merkle proof per reduction step.
-        let mut layer_bits = lde_bits;
-        for &arity_bits in &fri_params.reduction_arity_bits {
-            layer_bits -= arity_bits;
-            round_size += (1 << arity_bits) * ext_size + merkle_proof_size(layer_bits);
-        }
-        size += fri_config.num_query_rounds * round_size;
-
-        // final_poly, pow_witness
-        size += fri_params.final_poly_len() * ext_size + field_size;
-
-        size
-    }
-
     /// Reads a value of type [`ProofTarget`] from `self`.
     #[inline]
     fn read_target_proof<const D: usize>(&mut self) -> IoResult<ProofTarget<D>> {
@@ -2322,7 +2271,7 @@ mod tests {
 
         let mut bytes = Vec::new();
         bytes.write_proof(&proof.proof).unwrap();
-        assert_eq!(bytes.len(), Buffer::proof_size::<C::F, C, D>(&data.common));
+        assert_eq!(Some(bytes.len()), data.common.proof_size::<C>());
         Ok(())
     }
 
