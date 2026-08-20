@@ -470,8 +470,6 @@ impl<F: RichField + Extendable<D>, const D: usize> CommonCircuitData<F, D> {
     }
 
     /// Checks that this data could have been produced by [`CircuitBuilder::build`].
-    ///
-    /// The verifier uses these fields as indices and loop bounds before looking at any proof data.
     pub fn validate(&self) -> Result<()> {
         let num_gates = self.gates.len();
         let SelectorsInfo {
@@ -479,8 +477,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CommonCircuitData<F, D> {
             groups,
         } = &self.selectors_info;
 
-        // The builder dedups gate types by `id()` and sorts them by `(degree, id)`. Requiring the
-        // same here also rules out repeated gate types, which multiply the verifier's work.
+        // Match the builder's ordering, which also forbids duplicate gates.
         for pair in self.gates.windows(2) {
             ensure!(
                 (pair[0].0.degree(), pair[0].0.id()) < (pair[1].0.degree(), pair[1].0.id()),
@@ -495,7 +492,6 @@ impl<F: RichField + Extendable<D>, const D: usize> CommonCircuitData<F, D> {
         // The groups partition `0..num_gates` into contiguous, non-empty ranges.
         let mut expected_start = 0;
         for group in groups {
-            // Checked before the slicing below, which would otherwise panic.
             ensure!(
                 group.start == expected_start && group.end <= num_gates,
                 "Selector groups must be contiguous and index into the gate list."
@@ -505,8 +501,8 @@ impl<F: RichField + Extendable<D>, const D: usize> CommonCircuitData<F, D> {
                 "Selector groups must be non-empty."
             );
 
-            // `selector_polynomials` keeps a group of size `s` whose largest gate has degree `d`
-            // within the quotient's degree budget, i.e. `s + d <= quotient_degree_factor + 2`.
+            // `selector_polynomials` bounds a group of size `s` whose largest gate has degree `d`
+            // by `s + d <= quotient_degree_factor + 2`.
             let max_degree_in_group = self.gates[group.clone()]
                 .iter()
                 .map(|g| g.0.degree())
@@ -531,16 +527,13 @@ impl<F: RichField + Extendable<D>, const D: usize> CommonCircuitData<F, D> {
             );
         }
 
-        // The selector polynomials are the first constant polynomials, and the verifier indexes
-        // `local_constants` with a selector index.
+        // The selector polynomials are the first constant polynomials.
         ensure!(
             groups.len() + self.num_lookup_selectors <= self.num_constants,
             "There are more selector polynomials than constant polynomials."
         );
 
-        // `evaluate_gate_constraints` allocates a buffer of this length and the verifier then
-        // reduces every element of it, so an inflated value is unbounded verifier work that no
-        // proof length pays for. The builder takes the maximum, so require exactly that.
+        // Sizes a buffer the verifier reduces over, so pin it exactly rather than bounding it.
         ensure!(
             self.num_gate_constraints
                 == self
@@ -557,15 +550,12 @@ impl<F: RichField + Extendable<D>, const D: usize> CommonCircuitData<F, D> {
             "quotient_degree_factor does not match the configured maximum."
         );
 
-        // `primitive_root_of_unity` asserts this, and the verifier raises `zeta` to the power
-        // `2^degree_bits` one squaring at a time.
+        // `primitive_root_of_unity` asserts this.
         ensure!(
             self.degree_bits() + self.config.fri_config.rate_bits <= F::TWO_ADICITY,
             "The LDE domain does not exist in this field."
         );
 
-        // `FriConfig::fri_params` clones these out of the circuit config. The challenger and the
-        // FRI verifier read different copies, so they have to agree.
         ensure!(
             self.fri_params.config == self.config.fri_config
                 && self.fri_params.hiding == self.config.zero_knowledge,
@@ -579,9 +569,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CommonCircuitData<F, D> {
     /// [`Write::write_proof`](crate::util::serialization::Write::write_proof).
     ///
     /// Returns `None` if the parameters are inconsistent, e.g. a cap taller than the tree it caps
-    /// or reduction arities exceeding the degree. This cannot happen for data that has passed
-    /// [`CommonCircuitData::validate`], so a caller sizing an untrusted proof can treat `None` as
-    /// a rejection rather than a panic.
+    /// or reduction arities exceeding the degree, which [`CommonCircuitData::validate`] rules out.
     pub fn proof_size<C: GenericConfig<D, F = F>>(&self) -> Option<usize> {
         let fri_config = &self.config.fri_config;
         let cap_height = fri_config.cap_height;
@@ -902,8 +890,6 @@ mod tests {
         Ok(())
     }
 
-    /// No proof length pays for this count, so it must be pinned exactly rather than bounded
-    /// from below by the gates' own constraint counts.
     #[test]
     fn rejects_inflated_num_gate_constraints() -> Result<()> {
         let mut common = test_circuit()?.common;
@@ -939,7 +925,6 @@ mod tests {
         Ok(())
     }
 
-    /// Sizing an untrusted proof must not depend on the parameters being consistent.
     #[test]
     fn proof_size_rejects_inconsistent_parameters() -> Result<()> {
         let common = test_circuit()?.common;
@@ -962,8 +947,7 @@ mod tests {
         Ok(())
     }
 
-    /// The verifier must reject a tampered verification key rather than iterate over a count taken
-    /// from it. Both counts here are attacker-controlled when the key is.
+    /// The verifier must reject a tampered key rather than iterate over a count taken from it.
     #[test]
     fn verifier_rejects_tampered_verification_key() -> Result<()> {
         let data = test_circuit()?;
@@ -980,8 +964,7 @@ mod tests {
         verifier_data.common.fri_params.config.num_query_rounds = 1 << 50;
         assert!(verifier_data.verify(proof.clone()).is_err());
 
-        // Sizes the buffer that `eval_vanishing_poly` reduces over. No proof length constrains
-        // it, so without this check the proof still verifies, just proportionally slower.
+        // Without this check the proof still verifies, just proportionally slower.
         let mut verifier_data = data.verifier_data();
         verifier_data.common.num_gate_constraints += 1;
         assert!(verifier_data.verify(proof).is_err());
