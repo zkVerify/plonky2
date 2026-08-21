@@ -19,6 +19,7 @@ pub(crate) fn verify<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, c
     verifier_data: &VerifierOnlyCircuitData<C, D>,
     common_data: &CommonCircuitData<F, D>,
 ) -> Result<()> {
+    common_data.validate()?;
     validate_proof_with_pis_shape(&proof_with_pis, common_data)?;
 
     let public_inputs_hash = proof_with_pis.get_public_inputs_hash();
